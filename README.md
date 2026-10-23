@@ -1,0 +1,123 @@
+# secure_vault
+
+Fast, encrypted key-value storage for Flutter. Your data is encrypted with
+AES-256-GCM and its key lives in the iOS/macOS Keychain or the Android Keystore,
+just like `flutter_secure_storage`, but reads are synchronous and writes are
+an order of magnitude faster.
+
+```dart
+final vault = await SecureVault.open('session');
+
+await vault.setString('token', 'eyJhbGciOi...');
+final token = vault.getString('token'); // synchronous, no await
+```
+
+## Why
+
+`flutter_secure_storage` sends every read and write over a platform channel
+to the keychain, which is slow and async-only. It also isn't built for more
+than a handful of small values. `shared_preferences` is fast but stores
+everything in plaintext.
+
+`secure_vault` keeps only one thing in the keychain: a random 256-bit key.
+Everything else lives in an encrypted file that is loaded into memory once.
+
+| 200 writes + 200 reads (iOS simulator, debug build) | Writes | Reads |
+| --- | --- | --- |
+| **secure_vault** | **72 ms** | **0.1 ms** |
+| flutter_secure_storage | 706 ms | 106 ms |
+
+Run the benchmark yourself in the `example/` app.
+
+## Features
+
+- **Synchronous reads** after a single `open()`.
+- **Typed API**: `String`, `int`, `double`, `bool`, `List<String>`, JSON maps
+  and lists, and raw `Uint8List` bytes.
+- **Reactive**: `vault.changes` streams every change, and `vault.watch('key')`
+  streams one key's value.
+- **Crash safe**: writes are appended and fsync'd. A record torn by a crash
+  is dropped on the next open, and compaction swaps files atomically.
+- **Tamper evident**: every record is authenticated. A modified, truncated
+  or swapped file is detected, never silently misread.
+- **Batch writes**: `setAll` writes many values with one disk flush.
+- **Bring your own key**: pass `encryptionKey` (for example derived from a
+  passphrase) or implement `VaultKeyStore`.
+- **Multiple vaults**: each name is a separate file with its own key.
+- Android, iOS, macOS, Windows and Linux.
+
+## Usage
+
+```dart
+import 'package:secure_vault/secure_vault.dart';
+
+final vault = await SecureVault.open('settings');
+
+// write: memory updates immediately, the future completes once on disk
+await vault.setBool('onboarded', true);
+await vault.setMap('profile', {'name': 'Ada', 'plan': 'pro'});
+await vault.setBytes('private_key', keyBytes);
+await vault.setAll({'theme': 'dark', 'fontScale': 1.2});
+
+// read
+vault.getBool('onboarded');      // true
+vault.getMap('profile')?['plan']; // 'pro'
+vault.get<String>('theme');      // 'dark'
+vault.containsKey('token');      // false
+
+// remove
+await vault.remove('theme');
+await vault.clear();
+
+// observe
+vault.watch<bool>('onboarded').listen((value) => print(value));
+
+// delete the file and its key entirely, for example on logout
+await SecureVault.destroy('settings');
+```
+
+### Opening options
+
+```dart
+await SecureVault.open(
+  'session',
+  keyStore: const SecureStorageKeyStore(), // where the key lives (default)
+  encryptionKey: null,                     // or a 32-byte key of your own
+  directory: null,                         // defaults to app support dir
+  onCorruption: VaultCorruptionPolicy.reset,
+);
+```
+
+`onCorruption` decides what happens when the file can't be decrypted:
+
+- `reset` (the default) wipes the unreadable data and starts empty.
+- `throwError` throws a `VaultException` and leaves the file alone.
+
+It applies when the key is gone (`VaultErrorCode.missingKey`) or when
+authentication fails (`VaultErrorCode.corrupted`).
+
+## Security model
+
+- Each vault has its own random 256-bit key, made with `Random.secure()`.
+  `SecureStorageKeyStore` stores it with `first_unlock_this_device`
+  accessibility on Apple platforms. That means it never syncs to iCloud and
+  stays readable by background tasks after the first unlock.
+- Every record is encrypted with AES-256-GCM and a random 96-bit nonce. The
+  vault name is bound in as associated data, so records can't be moved
+  between vaults.
+- The key is device-bound, so a vault file restored onto another device
+  can't be read. You'll get `missingKey`, which the `reset` policy handles by
+  starting fresh. Treat vault contents like a cache of secrets, not the only
+  copy of important data.
+- Decrypted values live in memory while the vault is open, like any
+  in-memory cache. This protects data at rest. It does not protect against
+  code running inside your app or on a compromised, rooted device.
+
+## Notes
+
+- Everything is held in memory, so this is built for settings, tokens,
+  credentials and small records. Up to a few megabytes is fine. It is not a
+  replacement for a database of large blobs.
+- Vaults above 64 KB decrypt on a background isolate when opened, so large
+  vaults don't stall the first frame.
+- Web isn't supported, because the browser has no secure place for the key.
