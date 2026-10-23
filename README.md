@@ -5,6 +5,8 @@ AES-256-GCM and its key lives in the iOS/macOS Keychain or the Android
 Keystore, just like `flutter_secure_storage`, but reads are synchronous and
 served from memory.
 
+<img src="https://raw.githubusercontent.com/Umar888/secure_vault/main/doc/screenshot.png" alt="secure_vault example app showing encrypted keys updating live" width="300">
+
 ```dart
 final vault = await SecureVault.open('session');
 

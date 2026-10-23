@@ -55,6 +55,16 @@ class _DemoPageState extends State<DemoPage> {
   void initState() {
     super.initState();
     // flutter run --dart-define=AUTOBENCH=true runs the benchmark on launch
+    // flutter run --dart-define=DEMO_DATA=true fills in sample values,
+    // handy for screenshots
+    if (const bool.fromEnvironment('DEMO_DATA')) {
+      _vault.setAll({
+        'access_token': 'eyJhbGciOiJIUzI1NiJ9.c2Vzc2lvbg',
+        'refresh_token': 'rt_8f3a91c2d7e64b05',
+        'user_id': 48213,
+        'biometrics_enabled': true,
+      });
+    }
     if (const bool.fromEnvironment('AUTOBENCH')) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _runBenchmark());
     }
