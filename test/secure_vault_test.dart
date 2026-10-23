@@ -140,6 +140,35 @@ void main() {
     await vault.close();
   });
 
+  test('buffered durability persists across close and reopen', () async {
+    var vault = await SecureVault.open(
+      'buffered',
+      keyStore: keys,
+      directory: dir,
+      durability: VaultDurability.buffered,
+    );
+    expect(vault.durability, VaultDurability.buffered);
+    for (var i = 0; i < 100; i++) {
+      await vault.setInt('n', i);
+    }
+    await vault.close();
+    vault = await open(name: 'buffered');
+    expect(vault.getInt('n'), 99);
+    await vault.close();
+  });
+
+  test('writes made during a flush land in the next batch', () async {
+    var vault = await open();
+    final first = vault.setString('a', '1');
+    // these join one pending batch while the first is being written
+    final rest = [for (var i = 0; i < 20; i++) vault.setString('b$i', '$i')];
+    await Future.wait([first, ...rest]);
+    vault = await reopen(vault);
+    expect(vault.length, 21);
+    expect(vault.getString('b19'), '19');
+    await vault.close();
+  });
+
   test('compacts overwritten history', () async {
     var vault = await open();
     for (var i = 0; i < 2000; i++) {

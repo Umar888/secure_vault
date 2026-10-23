@@ -5,10 +5,13 @@ import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:path_provider/path_provider.dart';
 
 import 'key_store.dart';
+import 'native_crypto.dart';
 import 'vault_change.dart';
+import 'vault_durability.dart';
 import 'vault_exception.dart';
 import 'vault_log.dart';
 
@@ -31,6 +34,11 @@ import 'vault_log.dart';
 ///
 /// The 256-bit key is generated on first use and kept in a [VaultKeyStore],
 /// by default the platform keychain via `flutter_secure_storage`.
+///
+/// On iOS and macOS, opening a vault and compacting it run AES-GCM natively
+/// through CryptoKit in one batch. Single writes always use
+/// the Dart cipher, which is faster than a platform channel call for small
+/// records. Both produce the same file format.
 class SecureVault {
   SecureVault._(
     this.name,
@@ -39,6 +47,8 @@ class SecureVault {
     this._cipher,
     this._entries,
     this._records,
+    this.usesNativeCrypto,
+    this.durability,
   );
 
   static final Map<String, Future<SecureVault>> _instances = {};
@@ -46,6 +56,14 @@ class SecureVault {
 
   /// The vault name given to [open].
   final String name;
+
+  /// Whether bulk encryption (open and compaction) runs on the platform's
+  /// native crypto. `false` on Windows and Linux, or when disabled through
+  /// `nativeCrypto` in [open].
+  final bool usesNativeCrypto;
+
+  /// How writes are made durable. See [VaultDurability].
+  final VaultDurability durability;
 
   final File _file;
   RandomAccessFile _handle;
@@ -55,6 +73,9 @@ class SecureVault {
   bool _closed = false;
 
   Future<void> _tail = Future.value();
+  final BytesBuilder _pending = BytesBuilder(copy: false);
+  int _pendingRecords = 0;
+  Completer<void>? _pendingDone;
   final StreamController<VaultChange> _changes =
       StreamController<VaultChange>.broadcast();
 
@@ -70,6 +91,10 @@ class SecureVault {
   /// - [directory] is where the vault file lives. Defaults to a
   ///   `secure_vault` folder in the app support directory.
   /// - [onCorruption] decides what happens when the file cannot be decrypted.
+  /// - [nativeCrypto] uses CryptoKit for bulk work on iOS and macOS. Turn it
+  ///   off to force the pure Dart cipher everywhere.
+  /// - [durability] trades crash safety for write speed. Defaults to
+  ///   [VaultDurability.sync].
   ///
   /// [name] may contain letters, digits, `_` and `-`, up to 64 characters.
   static Future<SecureVault> open(
@@ -78,6 +103,8 @@ class SecureVault {
     List<int>? encryptionKey,
     Directory? directory,
     VaultCorruptionPolicy onCorruption = VaultCorruptionPolicy.reset,
+    bool nativeCrypto = true,
+    VaultDurability durability = VaultDurability.sync,
   }) async {
     _checkName(name);
     if (encryptionKey != null && encryptionKey.length != 32) {
@@ -96,6 +123,8 @@ class SecureVault {
           keyStore ?? const SecureStorageKeyStore(),
           encryptionKey == null ? null : Uint8List.fromList(encryptionKey),
           onCorruption,
+          nativeCrypto && await NativeCrypto.isAvailable(),
+          durability,
         );
       } catch (_) {
         _instances.remove(file.path);
@@ -146,6 +175,8 @@ class SecureVault {
     VaultKeyStore keyStore,
     Uint8List? suppliedKey,
     VaultCorruptionPolicy onCorruption,
+    bool native,
+    VaultDurability durability,
   ) async {
     await file.parent.create(recursive: true);
     var bytes = await file.exists() ? await file.readAsBytes() : Uint8List(0);
@@ -172,19 +203,13 @@ class SecureVault {
       await keyStore.write(_keyId(name), key);
     }
 
-    // large vaults decrypt off the UI isolate
-    final keyBytes = key;
-    final data = bytes;
-    var result = data.length > 64 * 1024
-        ? await Isolate.run(() => parseVault(data, keyBytes, name))
-        : parseVault(data, keyBytes, name);
-
+    var result = await _decode(bytes, key, name, native);
     if (result.failure != null) {
       await resetOrThrow(
         VaultErrorCode.corrupted,
         'vault "$name" could not be decrypted: ${result.failure}',
       );
-      result = parseVault(bytes, keyBytes, name);
+      result = loadWithDart(bytes, key, name);
     }
 
     final RandomAccessFile handle;
@@ -208,10 +233,44 @@ class SecureVault {
       name,
       file,
       handle,
-      RecordCipher(keyBytes, name),
+      RecordCipher(key, name),
       Map.of(result.entries),
       result.records,
+      native,
+      durability,
     );
+  }
+
+  // vaults this big decode off the UI isolate
+  static const _isolateThreshold = 64 * 1024;
+
+  static Future<LoadResult> _decode(
+    Uint8List bytes,
+    Uint8List key,
+    String name,
+    bool native,
+  ) async {
+    final large = bytes.length > _isolateThreshold;
+    if (native && bytes.length > headerLength) {
+      final scan = scanFrames(bytes);
+      if (scan.failure != null) return LoadResult.failed(scan.failure!);
+      try {
+        final clear = await NativeCrypto.decryptAll(
+          key,
+          vaultAad(name),
+          Uint8List.sublistView(bytes, headerLength, scan.validLength),
+          count: scan.boxes.length,
+        );
+        return large
+            ? await Isolate.run(() => replay(scan, clear))
+            : replay(scan, clear);
+      } on PlatformException {
+        // native side failed as a whole, not a bad record: use Dart instead
+      }
+    }
+    return large
+        ? await Isolate.run(() => loadWithDart(bytes, key, name))
+        : loadWithDart(bytes, key, name);
   }
 
   static Uint8List _generateKey() {
@@ -290,7 +349,7 @@ class SecureVault {
     final stored = _toStored(value);
     _entries[key] = stored;
     _emit(VaultChange(key: key, value: _read(key)));
-    final record = _cipher.encodeSet(key, stored);
+    final record = _cipher.seal(RecordCipher.setOp(key, stored));
     return _append([record]);
   }
 
@@ -328,10 +387,10 @@ class SecureVault {
     for (final MapEntry(:key, :value) in stored.entries) {
       if (value == null) {
         if (_entries.remove(key) == null) continue;
-        records.add(_cipher.encodeRemove(key));
+        records.add(_cipher.seal(RecordCipher.removeOp(key)));
       } else {
         _entries[key] = value;
-        records.add(_cipher.encodeSet(key, value));
+        records.add(_cipher.seal(RecordCipher.setOp(key, value)));
       }
       _emit(VaultChange(key: key, value: _read(key)));
     }
@@ -343,7 +402,7 @@ class SecureVault {
     _checkOpen();
     if (_entries.remove(key) == null) return _tail;
     _emit(VaultChange(key: key, value: null));
-    return _append([_cipher.encodeRemove(key)]);
+    return _append([_cipher.seal(RecordCipher.removeOp(key))]);
   }
 
   /// Removes every key.
@@ -351,7 +410,7 @@ class SecureVault {
     _checkOpen();
     _entries.clear();
     _emit(const VaultChange(key: null, value: null));
-    return _append([_cipher.encodeClear()]);
+    return _append([_cipher.seal(RecordCipher.clearOp())]);
   }
 
   Object _toStored(Object value) {
@@ -419,6 +478,8 @@ class SecureVault {
     if (_closed) return;
     _closed = true;
     await _tail;
+    // buffered writes get their fsync here
+    if (durability == VaultDurability.buffered) await _handle.flush();
     await _handle.close();
     await _changes.close();
     _instances.remove(_file.path);
@@ -430,28 +491,44 @@ class SecureVault {
     }
   }
 
+  // Group commit: records join a pending batch, and one queued job writes
+  // the whole batch with a single fsync. Writes made while a batch is on its
+  // way to disk start the next batch instead of waiting for their own fsync.
   Future<void> _append(List<Uint8List> records) {
     if (records.isEmpty) return _tail;
-    return _enqueue(() async {
+    records.forEach(_pending.add);
+    _pendingRecords += records.length;
+    final queued = _pendingDone;
+    if (queued != null) return queued.future;
+
+    final done = _pendingDone = Completer<void>();
+    _enqueue(() async {
+      final bytes = _pending.takeBytes();
+      final count = _pendingRecords;
+      _pendingRecords = 0;
+      _pendingDone = null;
       try {
-        final builder = BytesBuilder(copy: false);
-        records.forEach(builder.add);
-        await _handle.writeFrom(builder.takeBytes());
-        await _handle.flush();
+        await _handle.writeFrom(bytes);
+        if (durability == VaultDurability.sync) await _handle.flush();
       } on FileSystemException catch (e) {
-        throw VaultException(VaultErrorCode.io, 'write to "$name" failed', e);
+        done.completeError(
+          VaultException(VaultErrorCode.io, 'write to "$name" failed', e),
+        );
+        return;
       }
-      _records += records.length;
+      _records += count;
       if (_records > _entries.length * 2 + 128) {
-        // the write itself already landed, so a failed compaction must not
-        // fail it; the next write tries again
+        // the batch already landed, so a failed compaction must not fail
+        // it; the next write tries again
         try {
           await _compactNow();
         } on VaultException {
           // ignore
         }
       }
+      done.complete();
     });
+    return done.future;
   }
 
   // writes run one at a time in call order; a failed write doesn't block
@@ -463,10 +540,24 @@ class SecureVault {
   }
 
   Future<void> _compactNow() async {
+    final plaintexts = [
+      for (final MapEntry(:key, :value) in _entries.entries)
+        RecordCipher.setOp(key, value),
+    ];
     final builder = BytesBuilder(copy: false)..add(vaultHeader());
-    for (final MapEntry(:key, :value) in _entries.entries) {
-      builder.add(_cipher.encodeSet(key, value));
+    var sealed = false;
+    // below this the channel round trip costs more than it saves
+    if (usesNativeCrypto && plaintexts.length >= 32) {
+      try {
+        builder.add(
+          await NativeCrypto.encryptAll(_cipher.key, _cipher.aad, plaintexts),
+        );
+        sealed = true;
+      } on PlatformException {
+        // fall through to Dart
+      }
     }
+    if (!sealed) plaintexts.map(_cipher.seal).forEach(builder.add);
     final temp = File('${_file.path}.tmp');
     try {
       await temp.writeAsBytes(builder.takeBytes(), flush: true);

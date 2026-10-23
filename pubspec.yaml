@@ -1,6 +1,6 @@
 name: secure_vault
 description: Fast encrypted key-value storage. AES-256-GCM with the key in the Keychain/Keystore, synchronous reads and change streams.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/Umar888/secure_vault
 issue_tracker: https://github.com/Umar888/secure_vault/issues
 topics:
@@ -10,7 +10,8 @@ topics:
   - key-value
   - database
 
-# uses dart:io files, so no web
+# uses dart:io files, so no web. Native crypto is Apple only; Android,
+# Windows and Linux use the Dart cipher
 platforms:
   android:
   ios:
@@ -33,3 +34,11 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: SecureVaultPlugin
+      macos:
+        pluginClass: SecureVaultPlugin

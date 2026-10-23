@@ -1,9 +1,9 @@
 # secure_vault
 
 Fast, encrypted key-value storage for Flutter. Your data is encrypted with
-AES-256-GCM and its key lives in the iOS/macOS Keychain or the Android Keystore,
-just like `flutter_secure_storage`, but reads are synchronous and writes are
-an order of magnitude faster.
+AES-256-GCM and its key lives in the iOS/macOS Keychain or the Android
+Keystore, just like `flutter_secure_storage`, but reads are synchronous and
+served from memory.
 
 ```dart
 final vault = await SecureVault.open('session');
@@ -22,16 +22,30 @@ everything in plaintext.
 `secure_vault` keeps only one thing in the keychain: a random 256-bit key.
 Everything else lives in an encrypted file that is loaded into memory once.
 
-| 200 writes + 200 reads (iOS simulator, debug build) | Writes | Reads |
-| --- | --- | --- |
-| **secure_vault** | **72 ms** | **0.1 ms** |
-| flutter_secure_storage | 706 ms | 106 ms |
+200 writes and 200 reads, measured with the `example/` app:
 
-Run the benchmark yourself in the `example/` app.
+| | iOS simulator (debug) | Android emulator (release) |
+| --- | --- | --- |
+| **secure_vault**, default `sync` durability | write 56 ms, read **0.1 ms** | write 4,405 ms, read **0.17 ms** |
+| **secure_vault**, `buffered` durability | write **20 ms** | write 664 ms |
+| flutter_secure_storage | write 836 ms, read 87 ms | write 578 ms, read 535 ms |
+
+Reads are always hundreds of times faster. Writes depend on durability. The
+default waits for `fsync` on every write, which is very slow on the Android
+emulator's disk. `buffered` skips that wait and is on par with
+`flutter_secure_storage` there (which doesn't `fsync` either). Real devices
+have much faster storage than the emulator; run the example app on yours.
+
+Opening a 5,000-key (600 KB) vault on the iOS simulator takes 14 ms with
+native CryptoKit, against 52 ms in pure Dart.
 
 ## Features
 
 - **Synchronous reads** after a single `open()`.
+- **Native crypto on Apple platforms**: CryptoKit decrypts the whole vault
+  in one batch on open, and re-encrypts it on compaction.
+- **Pick your durability**: `fsync` every write (default), or `buffered` for
+  speed. Writes made while one is in flight share a single `fsync`.
 - **Typed API**: `String`, `int`, `double`, `bool`, `List<String>`, JSON maps
   and lists, and raw `Uint8List` bytes.
 - **Reactive**: `vault.changes` streams every change, and `vault.watch('key')`
@@ -85,8 +99,18 @@ await SecureVault.open(
   encryptionKey: null,                     // or a 32-byte key of your own
   directory: null,                         // defaults to app support dir
   onCorruption: VaultCorruptionPolicy.reset,
+  durability: VaultDurability.sync,        // or .buffered
+  nativeCrypto: true,                      // CryptoKit on iOS / macOS
 );
 ```
+
+`durability` controls when a write's future completes:
+
+- `sync` (the default) waits until the OS confirms the data is on physical
+  storage. It survives app crashes and power loss.
+- `buffered` hands the data to the OS and returns. It survives app crashes,
+  but the latest writes can be lost if the device loses power. The file is
+  still `fsync`'d on `close()` and before compaction.
 
 `onCorruption` decides what happens when the file can't be decrypted:
 
@@ -118,6 +142,12 @@ authentication fails (`VaultErrorCode.corrupted`).
 - Everything is held in memory, so this is built for settings, tokens,
   credentials and small records. Up to a few megabytes is fine. It is not a
   replacement for a database of large blobs.
-- Vaults above 64 KB decrypt on a background isolate when opened, so large
-  vaults don't stall the first frame.
+- Opening a vault decrypts every record. On iOS and macOS this runs in
+  CryptoKit on a background thread. Elsewhere, vaults above 64 KB decrypt on
+  a background isolate, so the first frame isn't blocked either way.
+- Single writes always use the Dart cipher. For one small record it's faster
+  than a round trip to native code.
+- Android, Windows and Linux use the Dart cipher for everything. On Android,
+  `javax.crypto` measured no faster than Dart, because of its setup cost per
+  record.
 - Web isn't supported, because the browser has no secure place for the key.

@@ -45,6 +45,9 @@ class _DemoPageState extends State<DemoPage> {
   bool _benchmarking = false;
   _BenchResult? _vaultResult;
   _BenchResult? _secureStorageResult;
+  _BenchResult? _bufferedResult;
+  Duration? _openNative;
+  Duration? _openDart;
 
   SecureVault get _vault => widget.vault;
 
@@ -89,6 +92,22 @@ class _DemoPageState extends State<DemoPage> {
     vaultRead.stop();
     await SecureVault.destroy('benchmark');
 
+    final buffered = await SecureVault.open(
+      'benchmark_buffered',
+      durability: VaultDurability.buffered,
+    );
+    final bufferedWrite = Stopwatch()..start();
+    for (var i = 0; i < count; i++) {
+      await buffered.setString('key$i', 'value-$i');
+    }
+    bufferedWrite.stop();
+    final bufferedRead = Stopwatch()..start();
+    for (var i = 0; i < count; i++) {
+      buffered.getString('key$i');
+    }
+    bufferedRead.stop();
+    await SecureVault.destroy('benchmark_buffered');
+
     const storage = FlutterSecureStorage();
     final storageWrite = Stopwatch()..start();
     for (var i = 0; i < count; i++) {
@@ -104,10 +123,55 @@ class _DemoPageState extends State<DemoPage> {
       await storage.delete(key: 'bench_key$i');
     }
 
+    // opening a big vault is where native crypto pays off
+    final big = await SecureVault.open('bench_open', nativeCrypto: false);
+    await big.setAll({
+      for (var i = 0; i < 5000; i++) 'key$i': 'value $i ${'x' * 64}',
+    });
+    await big.close();
+    // warm up both paths, then alternate and keep the best of each so
+    // neither side benefits from running second
+    Future<Duration> timeOpen({required bool native}) async {
+      final watch = Stopwatch()..start();
+      await (await SecureVault.open(
+        'bench_open',
+        nativeCrypto: native,
+      )).close();
+      return watch.elapsed;
+    }
+
+    await timeOpen(native: true);
+    await timeOpen(native: false);
+    var nativeBest = const Duration(days: 1);
+    var dartBest = const Duration(days: 1);
+    for (var round = 0; round < 3; round++) {
+      final n = await timeOpen(native: true);
+      final d = await timeOpen(native: false);
+      if (n < nativeBest) nativeBest = n;
+      if (d < dartBest) dartBest = d;
+    }
+    await SecureVault.destroy('bench_open');
+    debugPrint(
+      'secure_vault bench: '
+      'vault write ${vaultWrite.elapsedMicroseconds}us '
+      'read ${vaultRead.elapsedMicroseconds}us | '
+      'buffered write ${bufferedWrite.elapsedMicroseconds}us | '
+      'fss write ${storageWrite.elapsedMicroseconds}us '
+      'read ${storageRead.elapsedMicroseconds}us | '
+      'open5000 native ${nativeBest.inMicroseconds}us '
+      'dart ${dartBest.inMicroseconds}us',
+    );
+
     if (!mounted) return;
     setState(() {
+      _openNative = nativeBest;
+      _openDart = dartBest;
       _benchmarking = false;
       _vaultResult = _BenchResult(vaultWrite.elapsed, vaultRead.elapsed);
+      _bufferedResult = _BenchResult(
+        bufferedWrite.elapsed,
+        bufferedRead.elapsed,
+      );
       _secureStorageResult = _BenchResult(
         storageWrite.elapsed,
         storageRead.elapsed,
@@ -155,7 +219,8 @@ class _DemoPageState extends State<DemoPage> {
                   StreamBuilder<VaultChange>(
                     stream: _vault.changes,
                     builder: (context, _) => Text(
-                      '${_vault.length} encrypted keys · AES-256-GCM',
+                      '${_vault.length} encrypted keys · AES-256-GCM · '
+                      '${_vault.usesNativeCrypto ? 'native' : 'Dart'} crypto',
                       style: const TextStyle(color: Colors.white70),
                     ),
                   ),
@@ -254,8 +319,38 @@ class _DemoPageState extends State<DemoPage> {
               ),
               const SizedBox(height: 8),
               _BenchCard(
+                label: 'secure_vault (buffered)',
+                result: _bufferedResult!,
+                highlight: true,
+              ),
+              const SizedBox(height: 8),
+              _BenchCard(
                 label: 'flutter_secure_storage',
                 result: _secureStorageResult!,
+              ),
+            ],
+            if (_openNative != null && _openDart != null) ...[
+              const SizedBox(height: 16),
+              Text('Open a 5,000-key vault', style: text.titleMedium),
+              const SizedBox(height: 8),
+              Card(
+                color: scheme.primaryContainer,
+                child: ListTile(
+                  title: const Text(
+                    'Native crypto',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  trailing: Text(_BenchCard.ms(_openNative!)),
+                ),
+              ),
+              Card(
+                child: ListTile(
+                  title: const Text(
+                    'Pure Dart',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  trailing: Text(_BenchCard.ms(_openDart!)),
+                ),
               ),
             ],
           ],
@@ -283,7 +378,7 @@ class _BenchCard extends StatelessWidget {
   final _BenchResult result;
   final bool highlight;
 
-  String _ms(Duration d) =>
+  static String ms(Duration d) =>
       '${(d.inMicroseconds / 1000).toStringAsFixed(1)} ms';
 
   @override
@@ -293,9 +388,7 @@ class _BenchCard extends StatelessWidget {
       color: highlight ? scheme.primaryContainer : null,
       child: ListTile(
         title: Text(label, style: const TextStyle(fontWeight: FontWeight.w700)),
-        subtitle: Text(
-          'write ${_ms(result.write)}  ·  read ${_ms(result.read)}',
-        ),
+        subtitle: Text('write ${ms(result.write)}  ·  read ${ms(result.read)}'),
       ),
     );
   }

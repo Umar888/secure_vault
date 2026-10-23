@@ -8,4 +8,5 @@ library;
 export 'src/key_store.dart';
 export 'src/secure_vault.dart';
 export 'src/vault_change.dart';
+export 'src/vault_durability.dart';
 export 'src/vault_exception.dart';
